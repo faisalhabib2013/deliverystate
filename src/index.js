@@ -1,15 +1,18 @@
 /**
- * index.js — COD Meta Tracking System
- * =====================================
- * Easy Orders + Bosta + Meta CAPI + Redis
+ * index.js — COD Meta Tracking System v6.0 — Multi-Store
+ * =========================================================
+ * يدعم متاجر متعددة على نفس السيرفر:
+ *   - كل متجر له Easy Orders Secret خاص (يحدد المتجر)
+ *   - كل متجر له Meta Pixel + CAPI Token خاص (يحدد لمن نبعت)
+ *   - Bosta API + Redis مشتركة بين كل المتاجر
  *
- * Architecture:
- *   زيارة المتجر  → header-script يجمع _fbp/_fbc → POST /collect-signals → Redis
- *   طلب جديد      → Easy Orders Webhook → POST /webhook/easy-orders → Redis
- *   Bosta تسلّم   → POST /webhook/bosta → بحث بالهاتف → Meta "Delivery" Event
- *   Bosta ترجع    → POST /webhook/bosta → Meta "OrderReturned" Event
+ * Environment Variables Format:
+ *   STORE_1_NAME, STORE_1_DOMAINS, STORE_1_EASY_ORDERS_SECRET,
+ *   STORE_1_META_PIXEL_ID, STORE_1_META_CAPI_TOKEN
+ *   (نفس النمط لـ STORE_2_*, STORE_3_*, ...)
  *
- * For configuration, see config.js and .env.example
+ * Backward compatible: لو ENV vars القديمة موجودة (META_PIXEL_ID, EASY_ORDERS_SECRET)
+ * بدون STORE_1_*, ستعمل كمتجر واحد افتراضي.
  */
 
 const express = require('express');
@@ -17,28 +20,71 @@ const crypto  = require('crypto');
 const https   = require('https');
 const path    = require('path');
 const Redis   = require('ioredis');
-const CFG     = require('./config');
 
+// ══════════════════════════════════════════════════════════
+// MULTI-STORE CONFIG
+// ══════════════════════════════════════════════════════════
+function loadStores() {
+  const list = [];
+  for (let i = 1; i <= 20; i++) {
+    const name = process.env[`STORE_${i}_NAME`];
+    if (!name) break;
+    list.push({
+      index:     i - 1,
+      name:      name,
+      secret:    process.env[`STORE_${i}_EASY_ORDERS_SECRET`] || '',
+      pixelId:   process.env[`STORE_${i}_META_PIXEL_ID`]      || '',
+      capiToken: process.env[`STORE_${i}_META_CAPI_TOKEN`]    || '',
+      domains:   (process.env[`STORE_${i}_DOMAINS`] || '')
+                  .split(',').map(s => s.trim()).filter(Boolean),
+    });
+  }
+  // Backward compat: متجر افتراضي من env vars القديمة
+  if (list.length === 0 && process.env.META_PIXEL_ID) {
+    list.push({
+      index:     0,
+      name:      'default',
+      secret:    process.env.EASY_ORDERS_SECRET || '',
+      pixelId:   process.env.META_PIXEL_ID      || '',
+      capiToken: process.env.META_CAPI_TOKEN    || '',
+      domains:   (process.env.ALLOWED_ORIGINS || '')
+                  .split(',').map(s => s.trim()).filter(Boolean),
+    });
+  }
+  return list;
+}
+
+const STORES           = loadStores();
+const SECRET_TO_STORE  = Object.fromEntries(STORES.filter(s => s.secret).map(s => [s.secret, s]));
+const ALLOWED_ORIGINS  = new Set(STORES.flatMap(s => s.domains));
+const DEFAULT_STORE    = STORES[0];
+
+const CONFIG = {
+  BOSTA_API_KEY:  process.env.BOSTA_API_KEY  || '',
+  BOSTA_BASE:     'https://app.bosta.co/api/v2',
+  META_CAPI_BASE: 'https://graph.facebook.com/v19.0',
+  REDIS_URL:      process.env.REDIS_URL      || '',
+  SIGNAL_TTL:     4  * 60 * 60,
+  ORDER_TTL:      30 * 24 * 60 * 60,
+  TRACKING_TTL:   30 * 24 * 60 * 60,
+  PROCESSED_TTL:  30 * 24 * 60 * 60,
+};
+
+// ══════════════════════════════════════════════════════════
+// APP + MIDDLEWARE
+// ══════════════════════════════════════════════════════════
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json());
 
-// ════════════════════════════════════════════════════════════
-// SERVE header-script.js
-// ════════════════════════════════════════════════════════════
 app.get('/header-script.js', (req, res) => {
   res.setHeader('Content-Type',  'application/javascript');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.sendFile(path.join(__dirname, '..', 'public', 'header-script.js'));
+  res.sendFile(path.join(__dirname, 'header-script.js'));
 });
 
-// ════════════════════════════════════════════════════════════
-// CORS
-// ════════════════════════════════════════════════════════════
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (CFG.ALLOWED_ORIGINS.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-  }
+  if (ALLOWED_ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods',     'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers',     'Content-Type');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -46,47 +92,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// ════════════════════════════════════════════════════════════
-// SECRETS (من Environment Variables)
-// ════════════════════════════════════════════════════════════
-const SECRETS = {
-  EASY_ORDERS_SECRET:  process.env.EASY_ORDERS_SECRET  || '',
-  EASY_ORDERS_API_KEY: process.env.EASY_ORDERS_API_KEY || '',
-  BOSTA_API_KEY:       process.env.BOSTA_API_KEY       || '',
-  META_PIXEL_ID:       process.env.META_PIXEL_ID       || '',
-  META_CAPI_TOKEN:     process.env.META_CAPI_TOKEN     || '',
-  REDIS_URL:           process.env.REDIS_URL           || '',
-};
-
-// التحقق من المتغيرات المطلوبة عند بدء السيرفر
-function validateConfig() {
-  const required = ['EASY_ORDERS_SECRET', 'BOSTA_API_KEY', 'META_PIXEL_ID', 'META_CAPI_TOKEN'];
-  const missing  = required.filter(k => !SECRETS[k]);
-  if (missing.length) {
-    console.error(`\n[Config] ⚠️  متغيرات بيئة مفقودة: ${missing.join(', ')}\n`);
-    console.error('راجع .env.example للتفاصيل\n');
-  }
-  if (!CFG.ALLOWED_ORIGINS.length) {
-    console.warn('[Config] ⚠️  ALLOWED_ORIGINS فارغ — لن يقدر أي متجر إرسال signals');
-  }
-  if (!CFG.EASY_ORDERS_STORE_IDS.length) {
-    console.warn('[Config] ⚠️  EASY_ORDERS_STORE_IDS فارغ — Easy Orders API fallback لن يعمل');
-  }
-}
-
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 // REDIS
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 let redis = null;
 function getRedis() {
-  if (!redis && SECRETS.REDIS_URL) {
-    redis = new Redis(SECRETS.REDIS_URL, { maxRetriesPerRequest: 3 });
+  if (!redis && CONFIG.REDIS_URL) {
+    redis = new Redis(CONFIG.REDIS_URL, { maxRetriesPerRequest: 3 });
     redis.on('connect', () => console.log('[Redis] connected'));
     redis.on('error',   (e) => console.error('[Redis] error:', e.message));
   }
   return redis;
 }
-
 async function rSet(key, value, ttl) {
   try { await getRedis()?.set(key, JSON.stringify(value), 'EX', ttl); } catch(e) {}
 }
@@ -100,20 +117,19 @@ async function rKeys(pattern) {
   try { return await getRedis()?.keys(pattern) || []; } catch(e) { return []; }
 }
 
-// In-memory fallback (إن لم يكن Redis متاحاً — للتطوير فقط)
 const mem = { signals: new Map(), orders: new Map(), tracking: new Map() };
 setInterval(() => {
-  const cutoff = Date.now() - CFG.TTL.SIGNAL * 1000;
+  const cutoff = Date.now() - CONFIG.SIGNAL_TTL * 1000;
   for (const [k, v] of mem.signals) if (v.ts && v.ts < cutoff) mem.signals.delete(k);
 }, 30 * 60 * 1000);
 
 const store = {
-  async setSignal(k, v)   { getRedis() ? await rSet(`sig:${k}`,   v, CFG.TTL.SIGNAL)   : mem.signals.set(k, v); },
-  async getSignal(k)      { return getRedis() ? await rGet(`sig:${k}`)   : (mem.signals.get(k)  || null); },
-  async delSignal(k)      { getRedis() ? await rDel(`sig:${k}`)          : mem.signals.delete(k); },
-  async setOrder(id, v)   { getRedis() ? await rSet(`order:${id}`, v, CFG.TTL.ORDER)   : mem.orders.set(id, v); },
+  async setSignal(k, v)   { getRedis() ? await rSet(`sig:${k}`,    v, CONFIG.SIGNAL_TTL)    : mem.signals.set(k, v); },
+  async getSignal(k)      { return getRedis() ? await rGet(`sig:${k}`)    : (mem.signals.get(k)  || null); },
+  async delSignal(k)      { getRedis() ? await rDel(`sig:${k}`)           : mem.signals.delete(k); },
+  async setOrder(id, v)   { getRedis() ? await rSet(`order:${id}`, v, CONFIG.ORDER_TTL)    : mem.orders.set(id, v); },
   async getOrder(id)      { return getRedis() ? await rGet(`order:${id}`) : (mem.orders.get(id) || null); },
-  async setTracking(k, v) { getRedis() ? await rSet(`track:${k}`, v, CFG.TTL.TRACKING) : mem.tracking.set(k, v); },
+  async setTracking(k, v) { getRedis() ? await rSet(`track:${k}`,  v, CONFIG.TRACKING_TTL) : mem.tracking.set(k, v); },
   async getTracking(k)    { return getRedis() ? await rGet(`track:${k}`)  : (mem.tracking.get(k) || null); },
 
   async getAllOrders() {
@@ -129,73 +145,52 @@ const store = {
     if (getRedis()) {
       const keys = await rKeys('sig:*');
       const res = [];
-      for (const k of keys) { const v = await rGet(k); if (v) res.push({ key: k.replace('sig:', ''), val: v }); }
+      for (const k of keys) { const v = await rGet(k); if (v) res.push({ key: k.replace('sig:',''), val: v }); }
       return res;
     }
     return Array.from(mem.signals.entries()).map(([key, val]) => ({ key, val }));
-  },
-  async scanSignals(prefix) {
-    const all = await this.getAllSignals();
-    return all.filter(({ key }) => key.startsWith(prefix));
   },
   async orderCount()    { return getRedis() ? (await rKeys('order:*')).length : mem.orders.size; },
   async trackingCount() { return getRedis() ? (await rKeys('track:*')).length : mem.tracking.size; },
 };
 
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 // HELPERS
-// ════════════════════════════════════════════════════════════
-const sha256 = v => v
-  ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex')
-  : undefined;
+// ══════════════════════════════════════════════════════════
+const sha256 = v => v ? crypto.createHash('sha256').update(String(v).toLowerCase().trim()).digest('hex') : undefined;
 
-// طبّع رقم الهاتف لصيغة محلية مصرية 01xxxxxxxxx (للمقارنة الداخلية)
 const normalizePhone = p => {
   if (!p) return p;
   let d = p.replace(/\D/g, '');
-  if (d.startsWith('20') && d.length === 12) d = d.slice(2); // remove country code
+  if (d.startsWith('20') && d.length === 12) d = d.slice(2);
   if (!d.startsWith('0') && d.length === 10) d = '0' + d;
   return d;
 };
 
-// حوّل لـ E.164 لـ Meta CAPI (201xxxxxxxxx بدون +)
 const phoneForMeta = p => {
   const n = normalizePhone(p);
   if (!n) return n;
   return n.startsWith('0') ? '2' + n : n;
 };
 
-const isDelivered = s => CFG.BOSTA_STATES.DELIVERED.includes(s);
-const isReturned  = s => CFG.BOSTA_STATES.RETURNED.includes(s);
-
-const calcDeliveryDays = c => Math.round((Date.now() - new Date(c).getTime()) / 86400000);
+const isDelivered = s => [45, '45', 'delivered', 'DELIVERED'].includes(s);
+const isReturned  = s => [46, '46', 48, '48', 49, '49', 100, '100', 101, '101', 'returned', 'RETURNED'].includes(s);
 
 const getClientIp = req =>
   req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-  req.headers['x-real-ip'] ||
-  req.socket?.remoteAddress ||
-  null;
+  req.headers['x-real-ip'] || req.socket?.remoteAddress || null;
 
 function apiCall(method, url, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const data   = body ? JSON.stringify(body) : null;
-    const req    = https.request({
-      hostname: parsed.hostname,
-      path:     parsed.pathname + parsed.search,
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        ...headers,
-        ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}),
-      },
+    const data = body ? JSON.stringify(body) : null;
+    const req = https.request({
+      hostname: parsed.hostname, path: parsed.pathname + parsed.search, method,
+      headers: { 'Content-Type': 'application/json', ...headers, ...(data ? { 'Content-Length': Buffer.byteLength(data) } : {}) },
     }, res => {
       let raw = '';
       res.on('data', c => raw += c);
-      res.on('end', () => {
-        try   { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
-        catch { resolve({ status: res.statusCode, body: raw }); }
-      });
+      res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); } catch { resolve({ status: res.statusCode, body: raw }); } });
     });
     req.on('error', reject);
     if (data) req.write(data);
@@ -203,312 +198,247 @@ function apiCall(method, url, body, headers = {}) {
   });
 }
 
-// ════════════════════════════════════════════════════════════
-// ENDPOINT: POST /collect-signals
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+// ENDPOINTS
+// ══════════════════════════════════════════════════════════
+
 app.post('/collect-signals', async (req, res) => {
   const { sessionId, fbp, fbc, userAgent, pageUrl } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-
   await store.setSignal(sessionId, {
-    fbp:       fbp       || null,
-    fbc:       fbc       || null,
-    clientIp:  getClientIp(req),
+    fbp: fbp || null, fbc: fbc || null,
+    clientIp: getClientIp(req),
     userAgent: userAgent || req.headers['user-agent'] || null,
-    pageUrl:   pageUrl   || null,
-    ts:        Date.now(),
+    pageUrl: pageUrl || null, ts: Date.now(),
   });
-
-  console.log(`[Signals] ${sessionId.slice(-8)} fbp:${fbp ? 'v' : 'x'} fbc:${fbc ? 'v' : 'x'}`);
+  console.log(`[Signals] ${sessionId.slice(-8)} fbp:${fbp?'v':'x'} fbc:${fbc?'v':'x'}`);
   res.json({ ok: true });
 });
 
-// ════════════════════════════════════════════════════════════
-// ENDPOINT: POST /link-session — ربط sessionId بـ orderId
-// ════════════════════════════════════════════════════════════
 app.post('/link-session', async (req, res) => {
   const { orderId, sessionId } = req.body;
-  if (!orderId || !sessionId) {
-    return res.status(400).json({ error: 'orderId and sessionId required' });
-  }
-
-  // لو الأوردر موصول مسبقاً، اربطه بالـ signals مباشرة
+  if (!orderId || !sessionId) return res.status(400).json({ error: 'orderId and sessionId required' });
   const order = await store.getOrder(orderId);
   if (order) {
     order.signals = await store.getSignal(sessionId) || {};
     await store.setOrder(orderId, order);
-    console.log(`[Link] late-link signals -> order ${orderId.slice(-8)}`);
+    console.log(`[Link] late-link -> order ${orderId.slice(-8)}`);
   }
-
-  // احفظ الربط للاستخدام لاحقاً عند وصول الـ webhook
   await store.setSignal('link_' + orderId, { sessionId, ts: Date.now() });
   console.log(`[Link] session -> order ${orderId.slice(-8)}`);
   res.json({ ok: true });
 });
 
-// ════════════════════════════════════════════════════════════
-// ENDPOINT: POST /webhook/easy-orders
-// ════════════════════════════════════════════════════════════
+// Easy Orders Webhook — يحدد المتجر من الـ secret
 app.post('/webhook/easy-orders', async (req, res) => {
-  if (req.headers['secret'] !== SECRETS.EASY_ORDERS_SECRET) {
-    console.warn('[EasyOrders] ❌ Invalid secret');
+  const secret = req.headers['secret'];
+  const fromStore = SECRET_TO_STORE[secret];
+
+  if (!fromStore) {
+    console.warn(`[EasyOrders] Unknown secret (got: "${secret?.slice(0, 8)}...")`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  res.json({ received: true });
+  res.json({ received: true, store: fromStore.name });
 
-  const payload = req.body;
-  if (payload.status === 'pending' && payload.id) {
-    await handleNewOrder(payload);
-  } else if (payload.event_type === 'order-status-update') {
-    console.log(`[EasyOrders] ${payload.order_id} ${payload.old_status} -> ${payload.new_status}`);
-  }
+  const p = req.body;
+  if (p.status === 'pending' && p.id) await handleNewOrder(p, fromStore);
+  else if (p.event_type === 'order-status-update') console.log(`[EasyOrders/${fromStore.name}] ${p.order_id} ${p.old_status} -> ${p.new_status}`);
 });
 
-// ════════════════════════════════════════════════════════════
-// ENDPOINT: POST /webhook/bosta
-// ════════════════════════════════════════════════════════════
+// Bosta Webhook — مشترك بين كل المتاجر
 app.post('/webhook/bosta', async (req, res) => {
   res.json({ received: true });
-
-  const p     = req.body;
+  const p = req.body;
   const tracking = String(p.tracking_number || p.trackingNumber || p._id || '');
-  const state    = p.state || p.status || p.currentStatus?.state || '';
+  const stateRaw = p.state || p.status || p.currentStatus?.state || '';
+  if (!tracking || !stateRaw) { console.warn('[Bosta] payload missing'); return; }
 
-  if (!tracking || !state) {
-    console.warn('[Bosta] payload missing tracking or state');
-    return;
-  }
+  console.log(`[Bosta] ${tracking} -> ${stateRaw}`);
 
-  console.log(`[Bosta] ${tracking} -> ${state}`);
+  if (!isDelivered(stateRaw) && !isReturned(stateRaw)) return;
 
-  let orderId   = await store.getTracking(tracking);
-  let orderData = orderId ? await store.getOrder(orderId) : null;
+  const processedKey = `processed_${tracking}_${stateRaw}`;
+  if (await store.getSignal(processedKey)) { console.log(`[Bosta] already processed`); return; }
 
-  // الـ payload لا يحتوي على الهاتف — نستدعي Bosta API
-  if (!orderData) {
-    const bostaDelivery = await fetchBostaDelivery(tracking);
-    if (bostaDelivery) {
-      const bostaPhone = normalizePhone(bostaDelivery.phone);
-      console.log(`[Bosta API] phone: ${bostaPhone}`);
-
-      if (bostaPhone) {
-        // محاولة 1: ابحث في Redis (أوردرات Easy Orders المحفوظة)
-        const allOrders = await store.getAllOrders();
-        for (const data of allOrders) {
-          if (normalizePhone(data.phone) === bostaPhone) {
-            orderData = data;
-            orderId   = data.orderId;
-            await store.setTracking(tracking, orderId);
-            console.log(`[Bosta] matched from Redis: ${bostaPhone} -> order ${orderId.slice(-8)}`);
-            break;
-          }
-        }
-
-        // محاولة 2: ابحث في Easy Orders API (للأوردرات اللي قبل تفعيل النظام)
-        if (!orderData && CFG.EASY_ORDERS_STORE_IDS.length) {
-          orderData = await fetchOrderFromEasyOrders(bostaPhone);
-          if (orderData) {
-            orderId = orderData.orderId;
-            await store.setOrder(orderId, orderData);
-            await store.setTracking(tracking, orderId);
-            console.log(`[Bosta] fetched from Easy Orders: ${orderId.slice(-8)}`);
-          }
-        }
-      }
-    }
-  }
-
-  if (!orderData) {
-    console.warn(`[Bosta] no order found for tracking: ${tracking}`);
-    // احفظه كـ pending — قد يصل الأوردر من Easy Orders لاحقاً
-    await store.setSignal('bosta_pending_' + tracking, { p, state, ts: Date.now() });
-    return;
-  }
-
-  await handleStatusUpdate(state, orderData);
+  await processBostaShipment(tracking, stateRaw, processedKey);
 });
 
-// ════════════════════════════════════════════════════════════
-// ENDPOINT: GET /health
-// ════════════════════════════════════════════════════════════
 app.get('/health', async (req, res) => {
   res.json({
-    ok:       true,
-    storage:  getRedis() ? 'redis' : 'memory',
-    orders:   await store.orderCount(),
+    ok: true,
+    version: '6.0-multi-store',
+    storage: getRedis() ? 'redis' : 'memory',
+    stores:  STORES.map(s => ({ name: s.name, domains: s.domains.length, hasSecret: !!s.secret, hasPixel: !!s.pixelId })),
+    orders: await store.orderCount(),
     tracking: await store.trackingCount(),
-    uptime:   Math.floor(process.uptime()) + 's',
-    stores:   CFG.EASY_ORDERS_STORE_IDS.length,
-    origins:  CFG.ALLOWED_ORIGINS.length,
+    uptime: Math.floor(process.uptime()) + 's',
   });
 });
 
-// ════════════════════════════════════════════════════════════
-// HANDLERS
-// ════════════════════════════════════════════════════════════
-async function handleNewOrder(order) {
-  console.log(`[New Order] ${order.id.slice(-8)} — ${order.full_name} — ${order.total_cost} ${CFG.CURRENCY}`);
+app.post('/admin/poll', (req, res) => {
+  res.json({ started: true, alreadyRunning: pollRunning });
+  pollBostaDeliveries();
+});
 
-  // 1) حاول إيجاد sessionId مربوط (من صفحة الشكر)
+// ══════════════════════════════════════════════════════════
+// CORE LOGIC
+// ══════════════════════════════════════════════════════════
+
+async function handleNewOrder(order, fromStore) {
+  console.log(`[New Order/${fromStore.name}] ${order.id.slice(-8)} -- ${order.full_name} -- ${order.total_cost} EGP`);
+
   const linkRecord = await store.getSignal('link_' + order.id);
   const sessionId  = linkRecord?.sessionId || null;
-  let   signals    = sessionId ? (await store.getSignal(sessionId) || {}) : {};
+  let signals      = sessionId ? (await store.getSignal(sessionId) || {}) : {};
 
-  // 2) لو لم نجد، طبّق time-based matching على آخر signal
   if (!signals.fbp && !signals.fbc) {
-    const cutoff = Date.now() - (CFG.SIGNAL_MATCH_WINDOW_SECONDS * 1000);
+    const cutoff = Date.now() - (3 * 60 * 1000);
     let latest = null, latestTs = 0;
     const allSigs = await store.getAllSignals();
     for (const { key, val } of allSigs) {
-      if (key.startsWith('link_') || key.startsWith('bosta_')) continue;
+      if (key.startsWith('link_') || key.startsWith('bosta_') || key.startsWith('processed_')) continue;
       if (val.ts && val.ts > cutoff && val.ts > latestTs) { latest = val; latestTs = val.ts; }
     }
-    if (latest) {
-      signals = latest;
-      console.log(`[Signals] time-match: ${Math.round((Date.now() - latestTs) / 1000)}s ago`);
-    }
+    if (latest) { signals = latest; console.log(`[Signals] time-match: ${Math.round((Date.now()-latestTs)/1000)}s ago`); }
   }
 
-  console.log(`[Signals] fbp:${signals.fbp ? 'v' : 'x'} fbc:${signals.fbc ? 'v' : 'x'} ip:${signals.clientIp ? 'v' : 'x'}`);
+  console.log(`[Signals] fbp:${signals.fbp?'v':'x'} fbc:${signals.fbc?'v':'x'} ip:${signals.clientIp?'v':'x'}`);
 
-  // 3) احفظ الأوردر في Redis
   await store.setOrder(order.id, {
-    orderId:   order.id,
-    totalCost: order.total_cost,
-    phone:     order.phone,
-    email:     order.email,
-    fullName:  order.full_name,
-    city:      order.government,
-    cartItems: order.cart_items || [],
-    createdAt: new Date().toISOString(),
+    orderId:    order.id,
+    storeIndex: fromStore.index,
+    storeName:  fromStore.name,
+    totalCost:  order.total_cost,
+    phone:      order.phone,
+    email:      order.email || null,
+    fullName:   order.full_name || '',
+    city:       order.government || '',
+    cartItems:  order.cart_items || [],
+    createdAt:  order.created_at || new Date().toISOString(),
     signals,
   });
+}
 
-  // 4) لو وصل Bosta webhook قبل Easy Orders، عالج الـ pending
-  const phone   = normalizePhone(order.phone);
-  const pending = await store.scanSignals('bosta_pending_');
-  for (const { key, val } of pending) {
-    const bostaDelivery = await fetchBostaDelivery(val.p?.trackingNumber || val.p?._id || '');
-    const pendingPhone  = normalizePhone(bostaDelivery?.phone || '');
-    if (pendingPhone && pendingPhone === phone) {
-      console.log(`[Bosta] processing pending webhook for order ${order.id.slice(-8)}`);
-      await store.delSignal(key);
-      await handleStatusUpdate(val.state, await store.getOrder(order.id));
-      break;
+async function processBostaShipment(tracking, stateRaw, processedKey, prefetchedData) {
+  // لو البيانات متوفرة من الـ list response، استخدمها بدل ما نعمل API call إضافي
+  const bosta = prefetchedData || await fetchBostaDelivery(tracking);
+  if (!bosta) {
+    console.warn(`[Bosta] couldn't fetch delivery for ${tracking}`);
+    return;
+  }
+
+  if (!prefetchedData) {
+    console.log(`[Bosta API] phone:${bosta.phone} city:${bosta.city} cod:${bosta.cod}`);
+  }
+  await rSet(`sig:${processedKey}`, { ts: Date.now() }, CONFIG.PROCESSED_TTL);
+
+  let enrichment = null;
+  let orderId = await store.getTracking(tracking);
+  if (orderId) enrichment = await store.getOrder(orderId);
+
+  if (!enrichment && bosta.businessReference) {
+    const byRef = await store.getOrder(bosta.businessReference);
+    if (byRef) {
+      enrichment = byRef; orderId = bosta.businessReference;
+      await store.setTracking(tracking, orderId);
+      console.log(`[Match] by businessReference -> ${orderId.slice(-8)} (store ${byRef.storeName})`);
     }
+  }
+
+  if (!enrichment && bosta.phone) {
+    const normPhone = normalizePhone(bosta.phone);
+    const allOrders = await store.getAllOrders();
+    // اختر الأحدث لو موجود في أكثر من متجر
+    let latest = null, latestTs = 0;
+    for (const o of allOrders) {
+      if (normalizePhone(o.phone) === normPhone) {
+        const ts = new Date(o.createdAt).getTime();
+        if (ts > latestTs) { latest = o; latestTs = ts; }
+      }
+    }
+    if (latest) {
+      enrichment = latest; orderId = latest.orderId;
+      await store.setTracking(tracking, orderId);
+      console.log(`[Match] by phone -> ${orderId.slice(-8)} (store ${latest.storeName})`);
+    }
+  }
+
+  // حدد المتجر اللي هنبعت لـ Pixel بتاعه
+  const targetStore = (enrichment?.storeIndex !== undefined && STORES[enrichment.storeIndex])
+    ? STORES[enrichment.storeIndex]
+    : DEFAULT_STORE;
+
+  if (enrichment) {
+    console.log(`[Enrich/${targetStore.name}] email:${enrichment.email?'v':'x'} fbp:${enrichment.signals?.fbp?'v':'x'} content_ids:${enrichment.cartItems?.length || 0}`);
+  } else {
+    console.log(`[Enrich/${targetStore.name}] no Redis match -- Bosta data only`);
+  }
+
+  if (isDelivered(stateRaw)) {
+    await sendMetaEvent('Delivery', bosta, enrichment, tracking, null, targetStore);
+  } else if (isReturned(stateRaw)) {
+    await sendMetaEvent('OrderReturned', bosta, enrichment, tracking, stateRaw, targetStore);
   }
 }
 
-async function handleStatusUpdate(state, orderData) {
-  const { orderId, totalCost, phone, email, fullName, city, cartItems, createdAt, signals = {} } = orderData;
-
-  const userData = {
-    phone, email, name: fullName, city,
-    fbp: signals.fbp, fbc: signals.fbc,
-    clientIp: signals.clientIp, userAgent: signals.userAgent,
-  };
-
-  if (isDelivered(state)) {
-    console.log(`[Delivered] order ${orderId.slice(-8)} — ${totalCost} ${CFG.CURRENCY}`);
-    await sendMetaEvent(CFG.EVENT_NAMES.DELIVERY, {
-      order_id:       orderId,
-      value:          totalCost,
-      currency:       CFG.CURRENCY,
-      content_ids:    cartItems?.map(i => i.product_id) || [],
-      content_type:   'product',
-      payment_method: 'cod',
-      delivery_city:  city,
-      delivery_days:  calcDeliveryDays(createdAt),
-    }, userData, `delivered_${orderId}`);
-
-    if (CFG.UPDATE_EASY_ORDERS_STATUS) {
-      await updateEasyOrdersStatus(orderId, 'delivered');
-    }
-  } else if (isReturned(state) && !CFG.SKIP_RETURNED_EVENTS) {
-    console.log(`[Returned] order ${orderId.slice(-8)}`);
-    await sendMetaEvent(CFG.EVENT_NAMES.RETURNED, {
-      order_id:      orderId,
-      value:         totalCost,
-      currency:      CFG.CURRENCY,
-      return_reason: String(state),
-    }, userData, `returned_${orderId}`);
-
-    if (CFG.UPDATE_EASY_ORDERS_STATUS) {
-      await updateEasyOrdersStatus(orderId, 'returned');
-    }
-  }
-}
-
-// ════════════════════════════════════════════════════════════
-// INTEGRATIONS
-// ════════════════════════════════════════════════════════════
 async function fetchBostaDelivery(trackingNumber) {
-  if (!trackingNumber) return null;
   try {
-    const url = `${CFG.ENDPOINTS.BOSTA}/deliveries/business/${trackingNumber}`;
-    const res = await apiCall('GET', url, null, { 'Authorization': SECRETS.BOSTA_API_KEY });
+    const url = `${CONFIG.BOSTA_BASE}/deliveries/business/${trackingNumber}`;
+    const res = await apiCall('GET', url, null, { 'Authorization': CONFIG.BOSTA_API_KEY });
     if (res.status !== 200) {
       console.warn(`[Bosta API] ${trackingNumber} -> ${res.status}`);
       return null;
     }
-    const d = res.body?.data || res.body;
-    return {
-      phone:             d?.receiver?.phone || d?.receiver?.secondPhone || null,
-      businessReference: d?.businessReference || null,
-      cod:               d?.cod || null,
-    };
+    return extractBostaData(res.body?.data || res.body, trackingNumber);
   } catch (e) {
-    console.error('[Bosta API] fetchDelivery error:', e.message);
+    console.error('[Bosta API] error:', e.message);
     return null;
   }
 }
 
-async function fetchOrderFromEasyOrders(phone) {
-  // جرّب كل store_id لحد ما تلاقي الأوردر
-  for (const storeId of CFG.EASY_ORDERS_STORE_IDS) {
-    try {
-      const url = `${CFG.ENDPOINTS.EASY_ORDERS}/external-apps/orders?store_id=${storeId}&phone=${encodeURIComponent(phone)}&limit=5&sort=created_at&direction=desc`;
-      const res = await apiCall('GET', url, null, { 'Api-Key': SECRETS.EASY_ORDERS_API_KEY });
-      if (res.status !== 200) continue;
-
-      const orders = res.body?.data || res.body?.orders || res.body?.results ||
-                     (Array.isArray(res.body) ? res.body : null);
-      if (!orders || !orders.length) continue;
-
-      const order = orders[0];
-      return {
-        orderId:   order.id,
-        totalCost: order.total_cost,
-        phone:     order.phone,
-        email:     order.email     || null,
-        fullName:  order.full_name || '',
-        city:      order.government || '',
-        cartItems: order.cart_items || [],
-        createdAt: order.created_at || new Date().toISOString(),
-        signals:   {},
-      };
-    } catch (e) {
-      console.error(`[EasyOrders] store ${storeId} error:`, e.message);
-    }
-  }
-  return null;
+// استخراج بيانات Bosta من response (يعمل لكلا من list response و single response)
+function extractBostaData(d, trackingNumber) {
+  if (!d) return null;
+  return {
+    trackingNumber:    trackingNumber || d.trackingNumber || d._id,
+    phone:             d?.receiver?.phone || d?.receiver?.secondPhone || null,
+    firstName:         d?.receiver?.firstName || '',
+    lastName:          d?.receiver?.lastName  || '',
+    fullName:          (d?.receiver?.firstName || '') + ' ' + (d?.receiver?.lastName || ''),
+    city:              d?.dropOffAddress?.city?.name || d?.dropOffAddress?.city || '',
+    zone:              d?.dropOffAddress?.zone?.name || '',
+    cod:               d?.cod ?? null,
+    businessReference: d?.businessReference || null,
+    creationDate:      d?.creationTimestamp || d?.createdAt || null,
+  };
 }
 
-async function updateEasyOrdersStatus(orderId, status) {
-  try {
-    await apiCall(
-      'PATCH',
-      `${CFG.ENDPOINTS.EASY_ORDERS}/external-apps/orders/${orderId}`,
-      { status },
-      { 'Api-Key': SECRETS.EASY_ORDERS_API_KEY }
-    );
-  } catch (e) {
-    console.error('[EasyOrders] update status error:', e.message);
+async function sendMetaEvent(eventName, bosta, enrichment, tracking, returnReason, targetStore) {
+  if (!targetStore?.pixelId || !targetStore?.capiToken) {
+    console.warn(`[Meta] store "${targetStore?.name}" بدون pixel/token -- skipped`);
+    return;
   }
-}
 
-async function sendMetaEvent(eventName, customData, userData, eventId) {
+  const phone     = bosta.phone || enrichment?.phone;
+  const firstName = bosta.firstName || enrichment?.fullName?.split(' ')[0] || '';
+  const lastName  = bosta.lastName  || enrichment?.fullName?.split(' ').slice(1).join(' ') || '';
+  const city      = bosta.city      || enrichment?.city;
+  const email     = enrichment?.email;
+  const fbp       = enrichment?.signals?.fbp;
+  const fbc       = enrichment?.signals?.fbc;
+  const clientIp  = enrichment?.signals?.clientIp;
+  const userAgent = enrichment?.signals?.userAgent;
+
+  const value       = bosta.cod || enrichment?.totalCost;
+  const contentIds  = enrichment?.cartItems?.map(i => i.product_id) || [];
+  const orderId     = enrichment?.orderId || bosta.businessReference || tracking;
+  const deliveryDays = enrichment?.createdAt
+    ? Math.round((Date.now() - new Date(enrichment.createdAt).getTime()) / 86400000)
+    : null;
+
+  const eventId = `${eventName.toLowerCase()}_${orderId}`;
+
   const payload = {
     data: [{
       event_name:    eventName,
@@ -516,44 +446,129 @@ async function sendMetaEvent(eventName, customData, userData, eventId) {
       action_source: 'website',
       event_id:      eventId,
       user_data: {
-        em:                userData.email     ? [sha256(userData.email)]                                : undefined,
-        ph:                userData.phone     ? [sha256(phoneForMeta(userData.phone))]                  : undefined,
-        fn:                userData.name      ? [sha256(userData.name.split(' ')[0])]                   : undefined,
-        ln:                userData.name      ? [sha256(userData.name.split(' ').slice(1).join(' '))]   : undefined,
-        ct:                userData.city      ? [sha256(userData.city.toLowerCase())]                   : undefined,
-        country:           [sha256(CFG.COUNTRY_CODE)],
-        fbp:               userData.fbp       || undefined,
-        fbc:               userData.fbc       || undefined,
-        client_ip_address: userData.clientIp  || undefined,
-        client_user_agent: userData.userAgent || undefined,
+        em:                email     ? [sha256(email)]                  : undefined,
+        ph:                phone     ? [sha256(phoneForMeta(phone))]    : undefined,
+        fn:                firstName ? [sha256(firstName)]              : undefined,
+        ln:                lastName  ? [sha256(lastName)]               : undefined,
+        ct:                city      ? [sha256(city.toLowerCase())]     : undefined,
+        country:           [sha256('eg')],
+        external_id:       orderId   ? [sha256(orderId)]                : undefined,
+        fbp:               fbp       || undefined,
+        fbc:               fbc       || undefined,
+        client_ip_address: clientIp  || undefined,
+        client_user_agent: userAgent || undefined,
       },
-      custom_data: customData,
+      custom_data: {
+        order_id:       orderId,
+        currency:       'EGP',
+        value:          value,
+        content_ids:    contentIds,
+        content_type:   contentIds.length ? 'product' : undefined,
+        tracking_number: tracking,
+        payment_method: 'cod',
+        delivery_city:  city,
+        delivery_days:  deliveryDays,
+        store_name:     targetStore.name,
+        ...(returnReason ? { return_reason: String(returnReason) } : {}),
+      },
     }],
   };
 
   try {
-    const url   = `${CFG.ENDPOINTS.META_CAPI}/${SECRETS.META_PIXEL_ID}/events?access_token=${SECRETS.META_CAPI_TOKEN}`;
-    const clean = JSON.parse(JSON.stringify(payload)); // remove undefined fields
-    const res   = await apiCall('POST', url, clean);
-    console.log(`[Meta] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'}`);
+    const url = `${CONFIG.META_CAPI_BASE}/${targetStore.pixelId}/events?access_token=${targetStore.capiToken}`;
+    const res = await apiCall('POST', url, JSON.parse(JSON.stringify(payload)));
+    console.log(`[Meta/${targetStore.name}] ${eventName} -> ${res.status} events_received:${res.body?.events_received ?? '?'} event_id:${eventId}`);
+    if (res.status !== 200) {
+      console.warn(`[Meta] response body:`, JSON.stringify(res.body).slice(0, 300));
+    }
   } catch (e) {
-    console.error(`[Meta] ${eventName} error:`, e.message);
+    console.error(`[Meta/${targetStore.name}] ${eventName} error:`, e.message);
   }
 }
 
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+// POLLING v7.0 — Real Pagination
+// =============================
+// اكتشفنا إن Bosta API يدعم pagination الحقيقية بـ:
+//   { page: N, limit: 200, sortBy: '-updatedAt' }
+// نسحب 600 شحنة كل ساعة (3 pages × 200) في ~9 ثوان
+// ══════════════════════════════════════════════════════════
+const POLL_INTERVAL_MS    = 60 * 60 * 1000;          // كل ساعة
+const POLL_PAGE_LIMIT     = 200;                     // 200 شحنة/صفحة (sweet spot)
+const POLL_MAX_PAGES      = 5;                       // 5 صفحات = 1000 شحنة كل دورة
+let pollRunning = false;
+
+async function pollBostaDeliveries() {
+  if (pollRunning) { console.log('[Poll] dropped - previous running'); return; }
+  pollRunning = true;
+  console.log('[Poll] ===== Starting Bosta poll =====');
+  let totalScanned = 0, totalSent = 0;
+  const t0 = Date.now();
+
+  try {
+    for (let page = 1; page <= POLL_MAX_PAGES; page++) {
+      const url  = `${CONFIG.BOSTA_BASE}/deliveries/search`;
+      const body = { page, limit: POLL_PAGE_LIMIT, sortBy: '-updatedAt' };
+      const pageStart = Date.now();
+      const res  = await apiCall('POST', url, body, { 'Authorization': CONFIG.BOSTA_API_KEY });
+
+      if (res.status !== 200) {
+        console.warn(`[Poll] page ${page} -> ${res.status}`);
+        break;
+      }
+
+      const deliveries = res.body?.data?.deliveries || [];
+      const pageMs = Date.now() - pageStart;
+      console.log(`[Poll] page ${page}: ${deliveries.length} deliveries (${pageMs}ms)`);
+
+      if (deliveries.length === 0) break;
+
+      for (const d of deliveries) {
+        totalScanned++;
+        const tracking = d.trackingNumber || d._id;
+        const state    = d.state?.code ?? d.state?.value ?? d.state ?? 0;
+
+        // فقط الحالات النهائية تهمنا
+        if (!isDelivered(state) && !isReturned(state)) continue;
+
+        const processedKey = `processed_${tracking}_${state}`;
+        if (await store.getSignal(processedKey)) continue;
+
+        // ✓ Optimization: نمرر بيانات Bosta من الـ list response مباشرة - بدون API call إضافي
+        const bostaData = extractBostaData(d, tracking);
+        await processBostaShipment(tracking, state, processedKey, bostaData);
+        totalSent++;
+      }
+    }
+  } catch (e) {
+    console.error('[Poll] error:', e.message);
+  } finally {
+    pollRunning = false;
+  }
+
+  const elapsed = Math.round((Date.now() - t0) / 1000);
+  console.log(`[Poll] ===== Done: scanned ${totalScanned}, sent ${totalSent} in ${elapsed}s =====`);
+}
+
+setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
+setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
+
+// ══════════════════════════════════════════════════════════
 // START
-// ════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
-validateConfig();
 app.listen(PORT, () => {
   console.log(`\n╔════════════════════════════════════════════╗`);
-  console.log(`║   COD Meta Tracking System — Running       ║`);
+  console.log(`║   COD Meta Tracking v7.1 — Optimized      ║`);
   console.log(`╠════════════════════════════════════════════╣`);
   console.log(`║  Port    : ${String(PORT).padEnd(32)}║`);
-  console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠️').padEnd(32)}║`);
-  console.log(`║  Stores  : ${String(CFG.EASY_ORDERS_STORE_IDS.length).padEnd(32)}║`);
-  console.log(`║  Origins : ${String(CFG.ALLOWED_ORIGINS.length).padEnd(32)}║`);
+  console.log(`║  Storage : ${(getRedis() ? 'Redis ✓' : 'Memory ⚠').padEnd(32)}║`);
+  console.log(`║  Stores  : ${String(STORES.length).padEnd(32)}║`);
+  console.log(`║  Origins : ${String(ALLOWED_ORIGINS.size).padEnd(32)}║`);
+  console.log(`╠════════════════════════════════════════════╣`);
+  for (const s of STORES) {
+    console.log(`║  • ${s.name.padEnd(12)} pixel:${s.pixelId ? '✓' : '✗'} secret:${s.secret ? '✓' : '✗'} dom:${String(s.domains.length).padEnd(2)} ║`);
+  }
   console.log(`╚════════════════════════════════════════════╝\n`);
 });
 

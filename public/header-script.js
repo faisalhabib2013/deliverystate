@@ -1,90 +1,131 @@
 /**
- * header-script.js — Client-side signals collector
- * ==================================================
- * يجمع _fbp و _fbc من الكوكيز ويبعتهم للسيرفر مع sessionId.
+ * header-script.js v4 — Client-side signals collector
+ * =====================================================
+ * إصلاح Race Condition للـ _fbp:
+ *   - Polling حتى 4 مرات (max 2 ثانية)
+ *   - يُرسَل مرة واحدة فقط (flag يمنع التكرار)
+ *   - لو _fbp وُجد مبكراً → يُرسَل فوراً ويلغي بقية المحاولات
+ *   - لو ما وُجدش بعد 2 ثانية → يُرسَل بدونه (الواقع مقبول)
  *
- * أين يُضاف:
- *   Easy Orders → Settings → Custom Code → Header
- *     <script src="https://YOUR-SERVER.example.com/header-script.js"></script>
- *
- * يحمي نفسه من:
- *   - In-App Browsers اللي بتحظر localStorage (Facebook, Instagram)
- *   - Incognito mode
- *   - تأخر تحميل _fbp cookie من Meta Pixel
+ * + Always Save Cookies (_fbc)
+ * + ETLD+1 domain scoping
+ * + Cross-domain sessionId via URL param
  */
 (function () {
-  // ⚠️  استبدل القيمة دي بالـ URL بتاع السيرفر الفعلي قبل الرفع
-  var SERVER = 'https://YOUR-SERVER.example.com';
+  var SERVER         = 'https://Your Server Domain is here';
+  var COOKIE_TTL     = 90;
+  var POLL_INTERVAL  = 500;   // كل 500ms
+  var POLL_MAX       = 8;     // أقصى 8 محاولات = 4 ثانية
 
+  // ─── Helpers ────────────────────────────────────────────────────
   function getCookie(name) {
     var m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
     return m ? decodeURIComponent(m[1]) : null;
   }
 
-  function getFbclid() {
-    return new URLSearchParams(window.location.search).get('fbclid');
+  function getEtldPlusOne() {
+    var parts = window.location.hostname.split('.');
+    return parts.length <= 2 ? window.location.hostname : '.' + parts.slice(-2).join('.');
   }
 
-  function buildFbc(fbclid) {
-    return fbclid ? 'fb.1.' + Date.now() + '.' + fbclid : null;
+  function setCookie(name, value, days) {
+    try {
+      var d = new Date();
+      d.setTime(d.getTime() + days * 86400000);
+      document.cookie = name + '=' + encodeURIComponent(value) +
+        '; expires=' + d.toUTCString() +
+        '; domain=' + getEtldPlusOne() +
+        '; path=/; SameSite=Lax';
+    } catch (e) {}
   }
 
-  // localStorage مع try/catch — حماية ضد المتصفحات اللي بتحظره
-  function lsGet(key) {
-    try { return localStorage.getItem(key); } catch (e) { return null; }
-  }
-  function lsSet(key, val) {
-    try { localStorage.setItem(key, val); } catch (e) { }
-  }
-  function lsDel(key) {
-    try { localStorage.removeItem(key); } catch (e) { }
-  }
+  function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function lsDel(k) { try { localStorage.removeItem(k); } catch (e) {} }
 
   function getOrCreateSession() {
+    var urlSid = new URLSearchParams(window.location.search).get('_msid');
+    if (urlSid) { lsSet('_msid', urlSid); return urlSid; }
     var sid = lsGet('_msid');
-    if (!sid) {
-      sid = 'ms_' + Math.random().toString(36).slice(2, 10) + '_' + Date.now();
-      lsSet('_msid', sid);
-    }
+    if (!sid) { sid = 'ms_' + Math.random().toString(36).slice(2,10) + '_' + Date.now(); lsSet('_msid', sid); }
     return sid;
   }
 
   function post(endpoint, data) {
     var body = JSON.stringify(data);
     if (navigator.sendBeacon) {
-      navigator.sendBeacon(
-        SERVER + endpoint,
-        new Blob([body], { type: 'application/json' })
-      );
+      navigator.sendBeacon(SERVER + endpoint, new Blob([body], { type: 'application/json' }));
     } else {
-      fetch(SERVER + endpoint, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    body,
-        keepalive: true,
-      }).catch(function () { });
+      fetch(SERVER + endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:body, keepalive:true }).catch(function(){});
     }
   }
 
-  var fbclid    = getFbclid();
+  function decorateCheckoutLinks(sid) {
+    try {
+      var links = document.querySelectorAll('a[href*="checkout"], a[href*="easyorders"], a[href*="payment"]');
+      for (var i = 0; i < links.length; i++) {
+        var h = links[i].href;
+        if (h.indexOf('_msid=') === -1) links[i].href = h + (h.indexOf('?') === -1 ? '?' : '&') + '_msid=' + encodeURIComponent(sid);
+      }
+    } catch(e) {}
+  }
+
+  // ─── Init ────────────────────────────────────────────────────────
+  var fbclid    = new URLSearchParams(window.location.search).get('fbclid');
   var sessionId = getOrCreateSession();
 
-  // ابعت signals
-  post('/collect-signals', {
-    sessionId: sessionId,
-    fbp:       getCookie('_fbp'),
-    fbc:       getCookie('_fbc') || buildFbc(fbclid),
-    userAgent: navigator.userAgent,
-    pageUrl:   window.location.href,
-  });
+  // Always Save Cookies: ابني _fbc واحفظه لو fbclid موجود
+  var fbc = getCookie('_fbc');
+  if (!fbc && fbclid) {
+    fbc = 'fb.1.' + Date.now() + '.' + fbclid;
+    setCookie('_fbc', fbc, COOKIE_TTL);
+  }
 
-  // لو على صفحة الشكر، اربط الـ session بالـ orderId
+  // ─── Race Condition Fix: Polling للـ _fbp ─────────────────────
+  var sent     = false;   // ← Flag يضمن الإرسال مرة واحدة فقط
+  var attempts = 0;
+  var pollTimer;
+
+  function tryCapture() {
+    if (sent) return;  // لو بُعِت بالفعل، وقف
+    attempts++;
+    var fbp = getCookie('_fbp');
+
+    if (fbp || attempts >= POLL_MAX) {
+      // إما وجدنا fbp، أو استنفدنا المحاولات → أرسل مرة واحدة
+      sent = true;
+      if (pollTimer) clearTimeout(pollTimer);
+
+      post('/collect-signals', {
+        sessionId:      sessionId,
+        fbp:            fbp  || null,
+        fbc:            fbc  || null,
+        userAgent:      navigator.userAgent,
+        pageUrl:        window.location.href,
+        eventSourceUrl: window.location.href,
+        fbpDelay:       attempts > 1 ? (attempts - 1) * POLL_INTERVAL : 0,  // للديباغ
+      });
+    } else {
+      // لسه ما وجدناش → استنى وحاول تاني
+      pollTimer = setTimeout(tryCapture, POLL_INTERVAL);
+    }
+  }
+
+  tryCapture();  // ابدأ فوراً
+
+  // زخرف الـ checkout links
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() { decorateCheckoutLinks(sessionId); });
+  } else {
+    decorateCheckoutLinks(sessionId);
+  }
+
+  // ─── Thank You page ──────────────────────────────────────────────
   var isThankYou = window.location.pathname.indexOf('thanks') !== -1;
   var orderId    = new URLSearchParams(window.location.search).get('order_id');
 
   if (isThankYou && orderId) {
     post('/link-session', { orderId: orderId, sessionId: sessionId });
-    // امسح الـ session ID بعد 5 ثوانٍ ليكون عند الشراء التالي جديداً
-    setTimeout(function () { lsDel('_msid'); }, 5000);
+    setTimeout(function() { lsDel('_msid'); }, 5000);
   }
 })();
