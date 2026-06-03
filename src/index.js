@@ -79,7 +79,7 @@ app.use(express.json());
 app.get('/header-script.js', (req, res) => {
   res.setHeader('Content-Type',  'application/javascript');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.sendFile(path.join(__dirname, 'header-script.js'));
+  res.sendFile(path.join(__dirname, '..', 'public', 'header-script.js'));
 });
 
 app.use((req, res, next) => {
