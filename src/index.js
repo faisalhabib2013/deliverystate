@@ -554,6 +554,16 @@ setInterval(pollBostaDeliveries, POLL_INTERVAL_MS);
 setTimeout(pollBostaDeliveries, 2 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════
+// GLOBAL ERROR HANDLER
+// ══════════════════════════════════════════════════════════
+app.use((err, req, res, next) => {
+  // العميل أغلق الاتصال قبل اكتمال الـ request (sendBeacon عند إغلاق الصفحة)
+  if (err.message === 'request aborted' || err.type === 'request.aborted') return;
+  console.error('[Error]', err.message);
+  if (!res.headersSent) res.status(500).json({ error: 'internal server error' });
+});
+
+// ══════════════════════════════════════════════════════════
 // START
 // ══════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
