@@ -1,4 +1,5 @@
-# COD Meta Tracking System — v7.1
+# COD Meta Tracking System — v7.1 By Eslam Elsayad
+https://www.facebook.com/EngEslamElsayad
 
 نظام تتبع تسليم الطلبات النقدية (Cash-on-Delivery) وإرسال أحداث Meta CAPI عند التسليم الفعلي.
 
